@@ -21,5 +21,30 @@ services:
       retries: 5
       start_period: 180s
 
+  # Dedicated worker that drains the chatbot queue (process_chat_message). It lives with the
+  # ollama stack so the same --ollama flag that starts the LLM also starts the worker that uses
+  # it; without this service the chatbot queue would have no consumer and chat turns would hang.
+  celery_worker_chatbot:
+    image: intelowlproject/intelowl:${REACT_APP_INTELOWL_VERSION}
+    container_name: intelowl_celery_worker_chatbot
+    hostname: celery_worker_chatbot
+    restart: unless-stopped
+    stop_grace_period: 3m
+    volumes:
+      - ../configuration:/opt/deploy/intel_owl/configuration
+      - generic_logs:/var/log/intel_owl
+      - shared_files:/opt/deploy/files_required
+    entrypoint:
+      - ./docker/entrypoints/celery_chatbot.sh
+    env_file:
+      - env_file_app
+    depends_on:
+      uwsgi:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
 volumes:
   ollama_data:

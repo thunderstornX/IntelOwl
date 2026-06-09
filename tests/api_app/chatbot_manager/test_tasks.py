@@ -2,13 +2,17 @@
 # See the file 'LICENSE' for copying permission.
 
 import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from django.test import TestCase, override_settings
 from django.utils.timezone import now
 
+from api_app.chatbot_manager import events
 from api_app.chatbot_manager.models import ChatMessage, ChatSession
-from api_app.chatbot_manager.tasks import delete_old_chat_sessions
+from api_app.chatbot_manager.tasks import delete_old_chat_sessions, process_chat_message
 from certego_saas.apps.user.models import User
+
+INMEMORY_CHANNEL_LAYER = {"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}}
 
 
 @override_settings(CHATBOT_MESSAGE_RETENTION_DAYS=30)
@@ -74,3 +78,88 @@ class DeleteOldChatSessionsTestCase(TestCase):
 
         self.assertEqual(delete_old_chat_sessions(), 0)
         self.assertTrue(ChatSession.objects.filter(pk=session.pk).exists())
+
+
+@override_settings(CHANNEL_LAYERS=INMEMORY_CHANNEL_LAYER)
+class ProcessChatMessageTestCase(TestCase):
+    """The Celery turn persists the exchange, streams start/end, and fails closed.
+
+    The agent executor is mocked, so the LLM/Ollama is never touched; the token/status events
+    come from the agent's own callbacks (covered in test_streaming) and are not exercised here.
+    """
+
+    def setUp(self):
+        self.user, _ = User.objects.get_or_create(username="chatbot_task_user")
+        self.session = ChatSession.objects.create(user=self.user)
+
+    @staticmethod
+    def _patched_layer(mock_get_layer):
+        layer = MagicMock()
+        layer.group_send = AsyncMock()
+        mock_get_layer.return_value = layer
+        return layer
+
+    @staticmethod
+    def _event_types(layer):
+        return [call.args[1]["type"] for call in layer.group_send.call_args_list]
+
+    @patch("api_app.chatbot_manager.tasks.get_channel_layer")
+    @patch("api_app.chatbot_manager.agent.agent.build_agent_executor")
+    def test_persists_turn_and_streams_start_end(self, mock_build, mock_get_layer):
+        layer = self._patched_layer(mock_get_layer)
+        executor = MagicMock()
+        executor.invoke.return_value = {"output": "Hi there"}
+        mock_build.return_value = executor
+
+        process_chat_message(self.session.id, "hello", self.user.id)
+
+        messages = list(
+            ChatMessage.objects.filter(session=self.session)
+            .order_by("timestamp")
+            .values_list("role", "content")
+        )
+        self.assertEqual(
+            messages,
+            [(ChatMessage.Role.USER, "hello"), (ChatMessage.Role.ASSISTANT, "Hi there")],
+        )
+        self.assertEqual(self._event_types(layer), [events.EVENT_START, events.EVENT_END])
+
+        end_payload = layer.group_send.call_args_list[-1].args[1]["payload"]
+        assistant = ChatMessage.objects.get(session=self.session, role=ChatMessage.Role.ASSISTANT)
+        self.assertEqual(end_payload["message_id"], assistant.id)
+        self.assertEqual(end_payload["content"], "Hi there")
+
+        # streaming requested on the model + callbacks attached at run level (not on the LLM)
+        self.assertTrue(mock_build.call_args.kwargs["streaming"])
+        self.assertIn("callbacks", executor.invoke.call_args.kwargs["config"])
+
+    @patch("api_app.chatbot_manager.tasks.get_channel_layer")
+    @patch("api_app.chatbot_manager.agent.agent.build_agent_executor")
+    def test_agent_failure_streams_error_and_drops_the_turn(self, mock_build, mock_get_layer):
+        layer = self._patched_layer(mock_get_layer)
+        executor = MagicMock()
+        executor.invoke.side_effect = ConnectionError("ollama down")
+        mock_build.return_value = executor
+
+        process_chat_message(self.session.id, "hello", self.user.id)
+
+        # failed turn is dropped: neither the user nor the assistant message is stored
+        self.assertFalse(ChatMessage.objects.filter(session=self.session).exists())
+        self.assertEqual(self._event_types(layer), [events.EVENT_START, events.EVENT_ERROR])
+        error_payload = layer.group_send.call_args_list[-1].args[1]["payload"]
+        self.assertEqual(error_payload["detail"], events.DETAIL_UNAVAILABLE)
+
+    @patch("api_app.chatbot_manager.tasks.get_channel_layer")
+    @patch("api_app.chatbot_manager.agent.agent.build_agent_executor")
+    def test_session_not_owned_by_user_is_rejected(self, mock_build, mock_get_layer):
+        layer = self._patched_layer(mock_get_layer)
+        other = User.objects.create(username="chatbot_task_other")
+        foreign_session = ChatSession.objects.create(user=other)
+
+        process_chat_message(foreign_session.id, "hello", self.user.id)
+
+        mock_build.assert_not_called()
+        self.assertFalse(ChatMessage.objects.filter(session=foreign_session).exists())
+        self.assertEqual(self._event_types(layer), [events.EVENT_ERROR])
+        error_payload = layer.group_send.call_args_list[0].args[1]["payload"]
+        self.assertEqual(error_payload["detail"], events.DETAIL_SESSION_NOT_FOUND)

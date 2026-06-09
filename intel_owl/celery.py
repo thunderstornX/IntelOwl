@@ -89,6 +89,13 @@ if not settings.AWS_SQS:
 app.conf.update(
     task_default_queue=get_queue_name(settings.DEFAULT_QUEUE),
     task_queues=task_queues,
+    # Pin the chat turn to the dedicated chatbot queue (drained by celery_worker_chatbot) so
+    # its long, LLM-bound runs never tie up the default workers, regardless of the call site.
+    task_routes={
+        "api_app.chatbot_manager.tasks.process_chat_message": {
+            "queue": get_queue_name(settings.CHATBOT_QUEUE),
+        },
+    },
     task_time_limit=1800,
     broker_url=settings.BROKER_URL,
     result_backend=settings.RESULT_BACKEND,

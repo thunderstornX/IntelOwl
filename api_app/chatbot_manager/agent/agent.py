@@ -42,7 +42,7 @@ Question: {input}
 REACT_PROMPT = PromptTemplate.from_template(_SYSTEM_PROMPT)
 
 
-def build_agent_executor(user) -> AgentExecutor:
+def build_agent_executor(user, streaming: bool = False) -> AgentExecutor:
     """Build a ReAct agent executor scoped to `user`.
 
     `ChatOllama` is the local LLM; `create_react_agent` wires the model + tools + prompt
@@ -50,11 +50,17 @@ def build_agent_executor(user) -> AgentExecutor:
     that loop until a Final Answer. `handle_parsing_errors=True` makes the executor feed
     a malformed model output back as an Observation instead of raising, which keeps small
     local models from crashing the turn on a formatting slip.
+
+    `streaming=True` makes `ChatOllama` emit token-level callbacks so the WebSocket path can
+    stream the answer live. No callbacks are bound to the model here: the caller attaches them
+    per run (`executor.invoke(..., config={"callbacks": [...]})`) so they also receive the
+    agent's tool actions, which originate from the executor and not from the LLM.
     """
     llm = ChatOllama(
         model=settings.OLLAMA_MODEL,
         base_url=settings.OLLAMA_BASE_URL,
         temperature=0,
+        streaming=streaming,
     )
     tools = build_tools(user=user)
     agent = create_react_agent(llm, tools, REACT_PROMPT)

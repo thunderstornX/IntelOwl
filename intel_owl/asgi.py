@@ -13,6 +13,7 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "intel_owl.settings")
 get_asgi_application()
 
 # pylint: disable=wrong-import-position
+from api_app.chatbot_manager.consumers import ChatConsumer  # noqa: E402
 from api_app.websocket import JobConsumer  # noqa: E402
 from intel_owl.middleware import WSAuthMiddleware  # noqa: E402
 
@@ -25,6 +26,7 @@ application = ProtocolTypeRouter(
                     URLRouter(
                         [
                             path("ws/jobs/<int:job_id>", JobConsumer.as_asgi()),
+                            path("ws/chat/", ChatConsumer.as_asgi()),
                         ]
                     )
                 )
